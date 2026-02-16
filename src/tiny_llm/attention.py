@@ -74,13 +74,44 @@ def causal_mask(L: int, S: int, dtype: mx.Dtype) -> mx.array:
 
 
 def scaled_dot_product_attention_grouped(
-    query: mx.array,
-    key: mx.array,
-    value: mx.array,
+    query: mx.array, # batch_size x num_query_heads x seq_length_q x head_dim
+    key: mx.array, # batch_size x num_heads x seq_length_kv x head_dim
+    value: mx.array, # batch_size x num_heads x seq_length_kv x head_dim
     scale: float | None = None,
-    mask: mx.array | str | None = None,
+    mask: mx.array | str | None = None, # batch_size x num_heads x seq_length_q x seq_length_kv, or "causal" (TODO)
 ) -> mx.array:
-    pass
+    num_query_heads, seq_length_q, head_dim = query.shape[-3:]
+    num_heads, seq_length_kv, _ = key.shape[-3:]
+    batch_dims = query.shape[:-3]
+
+    # In the grouped attention setting, we have num_query_heads = num_heads * num_repeats, 
+    # where num_repeats is how many query heads attend to the same key/value heads.
+    n_repeats = num_query_heads // num_heads
+
+    # default scale = 1/sqrt(D)
+    if scale is None:
+        D = query.shape[-1]
+        scale = 1.0 / (D ** 0.5)
+    
+    # Resharp query to extract the `num_repeats`
+    query = query.reshape(*batch_dims, num_heads, n_repeats, seq_length_q, head_dim)
+    # Then, insert an extra dimension to key and value for broadcasting
+    key = key.reshape(*batch_dims, num_heads, 1, seq_length_kv, head_dim)
+    value = value.reshape(*batch_dims, num_heads, 1, seq_length_kv, head_dim)
+
+    # Q @ K^T
+    scores = query @ mx.swapaxes(key, -1, -2)
+    scores = scores * scale
+    if isinstance(mask, mx.array):
+        mask = mask.reshape(scores.shape)
+        scores = scores + mask
+    
+    attention_weights = softmax(scores, axis=-1)
+    output = attention_weights @ value
+
+    # Reshape output back
+    output = output.reshape(*batch_dims, num_query_heads, seq_length_q, head_dim)
+    return output
 
 
 def flash_attention(
