@@ -70,7 +70,12 @@ class SimpleMultiHeadAttention:
 
 
 def causal_mask(L: int, S: int, dtype: mx.Dtype) -> mx.array:
-    pass
+    # k means which diagonal to start the mask, 
+    # e.g. if L=S, k=1 to mask out the upper diagonal (exclude the main diagonal)
+    #      if L=5, S=3, k=3 to mask out the upper half diagonal (3 elements in the top-right corner)
+    k = S - L + 1 
+    mask = mx.triu(mx.full((L, S), -mx.inf, dtype=dtype), k)
+    return mask
 
 
 def scaled_dot_product_attention_grouped(
@@ -78,7 +83,7 @@ def scaled_dot_product_attention_grouped(
     key: mx.array, # batch_size x num_heads x seq_length_kv x head_dim
     value: mx.array, # batch_size x num_heads x seq_length_kv x head_dim
     scale: float | None = None,
-    mask: mx.array | str | None = None, # batch_size x num_heads x seq_length_q x seq_length_kv, or "causal" (TODO)
+    mask: mx.array | str | None = None, # batch_size x num_heads x seq_length_q x seq_length_kv, or "causal"
 ) -> mx.array:
     num_query_heads, seq_length_q, head_dim = query.shape[-3:]
     num_heads, seq_length_kv, _ = key.shape[-3:]
@@ -105,7 +110,10 @@ def scaled_dot_product_attention_grouped(
     if isinstance(mask, mx.array):
         mask = mask.reshape(scores.shape)
         scores = scores + mask
-    
+    elif isinstance(mask, str) and mask == "causal":
+        mask = causal_mask(seq_length_q, seq_length_kv, query.dtype)
+        scores = scores + mask
+
     attention_weights = softmax(scores, axis=-1)
     output = attention_weights @ value
 
