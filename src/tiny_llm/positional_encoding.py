@@ -72,5 +72,22 @@ class RoPE:
             # Reshape back to original shape
             return output.reshape(batch_size, seq_length, num_heads, head_dim)
         else:
-            pass
+            # Non-traditional RoPE for Qwen2: split dimensions in half
+            # First half gets frequencies applied one way, second half another way
+            half_dim = head_dim // 2
+            x1 = x[..., :half_dim]  # (batch, seq_length, num_heads, half_dim)
+            x2 = x[..., half_dim:]  # (batch, seq_length, num_heads, half_dim)
+            
+            # Reshape for broadcasting
+            cos_freqs = cos_freqs[None, :, None, :]  # (1, seq_length, 1, dims // 2)
+            sin_freqs = sin_freqs[None, :, None, :]  # (1, seq_length, 1, dims // 2)
+            
+            # Apply rotation to both halves
+            # output1 = x1 * cos - x2 * sin
+            # output2 = x1 * sin + x2 * cos
+            output1 = x1 * cos_freqs - x2 * sin_freqs
+            output2 = x1 * sin_freqs + x2 * cos_freqs
+            
+            # Concatenate back
+            return mx.concatenate([output1, output2], axis=-1)
             
