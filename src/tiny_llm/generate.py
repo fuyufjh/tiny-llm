@@ -9,10 +9,28 @@ def simple_generate(
     model: Qwen2ModelWeek1,
     tokenizer: TokenizerWrapper,
     prompt: str,
-    sampler: Callable[[mx.array], mx.array] | None,
+    sampler: Callable[[mx.array], mx.array] | None, # 
 ) -> str:
     def _step(model, y):
-        pass
+        y = y[None, :]  # add batch dimension
+        h = model(y)
+        logits = h[:, -1, :]
+        return mx.argmax(logits, axis=-1)
+
+    # prefill with the prompt
+    tokens = mx.array(tokenizer.encode(prompt, add_special_tokens=False))
+    detokenizer = tokenizer.detokenizer
+    detokenizer.reset()
+
+    while True:
+        token = _step(model, tokens)
+        # mx.eval(token)
+        tokens = mx.concat([tokens, token])
+        if token.item() == tokenizer.eos_token_id:
+            break
+        detokenizer.add_token(token.item())
+        print(detokenizer.last_segment, end="", flush=True)
+
 
 
 def simple_generate_with_kv_cache(
