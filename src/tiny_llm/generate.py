@@ -9,13 +9,17 @@ def simple_generate(
     model: Qwen2ModelWeek1,
     tokenizer: TokenizerWrapper,
     prompt: str,
-    sampler: Callable[[mx.array], mx.array] | None, # 
+    sampler: Callable[[mx.array], mx.array] | None,
 ) -> str:
     def _step(model, y):
         y = y[None, :]  # add batch dimension
         h = model(y)
         logits = h[:, -1, :]
-        return mx.argmax(logits, axis=-1)
+        if sampler is None:
+            return mx.argmax(logits, axis=-1)
+        else:
+            logprobs = logits - mx.logsumexp(logits, keepdims=True)  # for numerical stability
+            return sampler(logprobs)
 
     # prefill with the prompt
     tokens = mx.array(tokenizer.encode(prompt, add_special_tokens=False))

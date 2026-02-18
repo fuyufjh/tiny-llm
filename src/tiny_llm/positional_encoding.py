@@ -44,8 +44,8 @@ class RoPE:
             cos_freqs = self.cos_freqs[offset]
             sin_freqs = self.sin_freqs[offset]
         elif isinstance(offset, list):
-            # TODO
-            raise NotImplementedError("List of slices not implemented yet")
+            cos_freqs = mx.concatenate([self.cos_freqs[o] for o in offset], axis=0)
+            sin_freqs = mx.concatenate([self.sin_freqs[o] for o in offset], axis=0)
         else:
             raise ValueError("Invalid offset type")
         
