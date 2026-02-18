@@ -59,12 +59,12 @@ class Qwen2MultiHeadAttention:
         q = self.rope(q, offset=offset_slices) # batch_size x seq_length x num_heads x head_dim
         k = self.rope(k, offset=offset_slices)
 
+        # Update the cache and fetch the updated full key and value
+        k, v, _, mask = cache.update_and_fetch(k, v, mask_length=seq_length, mask=mask)
+
         q = q.transpose(0, 2, 1, 3) # batch_size x num_heads x seq_length x head_dim
         k = k.transpose(0, 2, 1, 3) # batch_size x num_kv_heads x seq_length x head_dim
         v = v.transpose(0, 2, 1, 3) # batch_size x num_kv_heads x seq_length x head_dim
-
-        # Update the cache and fetch the updated full key and value
-        q, k, _, mask = cache.update_and_fetch(q, k, mask_length=seq_length, mask=mask)
 
         x = scaled_dot_product_attention_grouped(q, k, v, mask=mask) # batch_size x num_heads x seq_length x head_dim
 

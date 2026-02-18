@@ -109,4 +109,4 @@ class TinyKvFullCache(TinyKvCache):
             self.value = mx.concatenate([self.value, value], axis=1)
             self.offset += key.shape[1]
         seq_len = self.key.shape[1]
-        return self.key, self.value, seq_len, None
+        return self.key, self.value, seq_len, mask
