@@ -6,6 +6,11 @@
 #include "mlx/utils.h"
 #include "quantized_matmul.h"
 
+#ifdef _METAL_
+#include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/utils.h"
+#endif
+
 namespace tiny_llm_ext {
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -176,9 +181,63 @@ void QuantizedMatmul::eval_cpu(const std::vector<mx::array> &inputs, std::vector
     }
 }
 
+#ifdef _METAL_
+
+void QuantizedMatmul::eval_gpu(const std::vector<mx::array> &inputs, std::vector<mx::array> &outputs) {
+    auto &scales = inputs[0];
+    auto &biases = inputs[1];
+    auto &a      = inputs[2];
+    auto &b      = inputs[3];
+    auto &out    = outputs[0];
+
+    auto &s = stream();
+    auto &device = mx::metal::device(s.device);
+
+    out.set_data(mx::allocator::malloc(out.nbytes()));
+
+    int M = a.shape()[0];
+    int N = a.shape()[1];
+    int K = b.shape()[0];
+
+    // Kernel name matches instantiate_kernel() calls in quantized_matmul.metal
+    const char *kname = nullptr;
+    if (out.dtype() == mx::float32) {
+        kname = "quantized_matmul_float";
+    } else if (out.dtype() == mx::float16) {
+        kname = "quantized_matmul_half";
+    } else {
+        throw std::runtime_error("QuantizedMatmul: unsupported dtype for GPU");
+    }
+    auto kernel = device.get_kernel(kname, device.get_library("tiny_llm_ext"));
+
+    auto &compute_encoder = device.get_command_encoder(s.index);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    // Buffers match [[buffer(N)]] annotations in the Metal kernel
+    compute_encoder.set_input_array(scales, 0);
+    compute_encoder.set_input_array(biases, 1);
+    compute_encoder.set_input_array(a, 2);
+    compute_encoder.set_input_array(b, 3);
+    compute_encoder.set_output_array(out, 4);
+    compute_encoder.set_bytes(M, 5);
+    compute_encoder.set_bytes(N, 6);
+    compute_encoder.set_bytes(K, 7);
+
+    // One thread per output element
+    size_t tgp_size = kernel->maxTotalThreadsPerThreadgroup();
+    size_t nelem = size_t(M) * K;
+    MTL::Size group_dims = MTL::Size(tgp_size, 1, 1);
+    MTL::Size grid_dims = MTL::Size(nelem, 1, 1);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+}
+
+#else  // Metal is not available
+
 void QuantizedMatmul::eval_gpu(const std::vector<mx::array> &inputs, std::vector<mx::array> &outputs) {
     throw std::runtime_error("QuantizedMatmul has no GPU implementation.");
 }
+
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 // Primitive Transforms
