@@ -21,8 +21,8 @@ mx::array quantized_matmul(const mx::array &scales,
                            const bool transpose_b,
                            mx::StreamOrDevice s /* = {} */
 ) {
-    if (scales.dtype() != mx::float16) {
-        throw std::runtime_error("quantized_matmul: scales must be float16");
+    if (scales.dtype() != mx::float16 && scales.dtype() != mx::float32) {
+        throw std::runtime_error("quantized_matmul: scales must be float16 or float32");
     }
     if (scales.dtype() != biases.dtype()) {
         throw std::runtime_error("quantized_matmul: scales and biases must have the same dtype");
@@ -76,6 +76,7 @@ mx::array quantized_matmul(const mx::array &scales,
 // Primitive CPU Backend Implementation
 ///////////////////////////////////////////////////////////////////////////////
 
+template<typename T> // T can be float16_t or float
 void quantized_matmul_impl(
     const mx::array &scales, const mx::array &biases,
     const mx::array &a, const mx::array &b,
@@ -90,7 +91,7 @@ void quantized_matmul_impl(
     encoder.set_input_array(b);
     encoder.set_output_array(out);
 
-    encoder.dispatch([out_ptr = out.data<float16_t>(), out_shape = out.shape(), out_strides = out.strides(),
+    encoder.dispatch([out_ptr = out.data<T>(), out_shape = out.shape(), out_strides = out.strides(),
                       group_size = group_size, bits = bits,
                       a = mx::array::unsafe_weak_copy(a), b = mx::array::unsafe_weak_copy(b),
                       scales = mx::array::unsafe_weak_copy(scales),
@@ -108,22 +109,22 @@ void quantized_matmul_impl(
         const int packs_per_item = 32 / bits;           // 4-bit values packed per uint32 (= 8)
         const int items_per_group = group_size / packs_per_item; // uint32 elements per group (= 8)
 
-        const float16_t *a_ptr = a.data<float16_t>();
-        const float16_t *scales_ptr = scales.data<float16_t>();
-        const float16_t *biases_ptr = biases.data<float16_t>();
+        const T *a_ptr = a.data<T>();
+        const T *scales_ptr = scales.data<T>();
+        const T *biases_ptr = biases.data<T>();
         const uint32_t *b_ptr = b.data<uint32_t>();
         const uint32_t pack_mask = (1u << bits) - 1u; // 0xF for 4 bits
 
         for (int i = 0; i < m; i++) {
             for (int j = 0; j < k; j++) {
-                float sum = 0.0f;
+                float sum = 0.0f; // always accumulate in float for better precision
 
                 for (int group_idx = 0; group_idx < group_per_row; group_idx++) {
                     // Scale and bias are indexed as [j, group_idx] in a flattened [K, group_per_row] layout
                     int64_t scales_idx = mx::elem_to_loc(j * group_per_row + group_idx, scales.shape(), scales.strides());
                     int64_t biases_idx = mx::elem_to_loc(j * group_per_row + group_idx, biases.shape(), biases.strides());
-                    float16_t scale = static_cast<float16_t>(scales_ptr[scales_idx]);
-                    float16_t bias  = static_cast<float16_t>(biases_ptr[biases_idx]);
+                    T scale = static_cast<T>(scales_ptr[scales_idx]);
+                    T bias  = static_cast<T>(biases_ptr[biases_idx]);
 
                     // Starting index in A for this group: row i, column group_idx * group_size
                     int64_t a_idx = mx::elem_to_loc(i * n + group_idx * group_size, a.shape(), a.strides());
@@ -140,8 +141,8 @@ void quantized_matmul_impl(
                             //   byte index: pack_idx / 2
                             //   nibble:     low bits when pack_idx is even, high bits when odd
                             uint8_t item_val = (b_bytes[pack_idx / 2] >> ((pack_idx % 2) * bits)) & pack_mask;
-                            float16_t a_val  = static_cast<float16_t>(a_ptr[a_idx]);
-                            float16_t b_real = static_cast<float16_t>(item_val) * scale + bias;
+                            T a_val  = static_cast<T>(a_ptr[a_idx]);
+                            T b_real = static_cast<T>(item_val) * scale + bias;
                             sum += static_cast<float>(a_val) * static_cast<float>(b_real);
                             a_idx += 1;
                         }
@@ -150,7 +151,7 @@ void quantized_matmul_impl(
                 }
 
                 int64_t out_idx = mx::elem_to_loc(i * k + j, out_shape, out_strides);
-                out_ptr[out_idx] = static_cast<float16_t>(sum);
+                out_ptr[out_idx] = static_cast<T>(sum);
             }
         }
     });
@@ -165,7 +166,10 @@ void QuantizedMatmul::eval_cpu(const std::vector<mx::array> &inputs, std::vector
 
     switch (a.dtype()) {
         case mx::float16:
-            quantized_matmul_impl(scales, biases, a, b, out, group_size_, bits_, stream());
+            quantized_matmul_impl<float16_t>(scales, biases, a, b, out, group_size_, bits_, stream());
+            break;
+        case mx::float32:
+            quantized_matmul_impl<float>(scales, biases, a, b, out, group_size_, bits_, stream());
             break;
         default:
             throw std::runtime_error("QuantizedMatmul: unsupported dtype");
