@@ -5,6 +5,7 @@
 
 #include "tiny_llm_ext.h"
 #include "axpby.h"
+#include "flash_attention.h"
 #include "quantized_matmul.h"
 
 namespace nb = nanobind;
@@ -33,6 +34,25 @@ NB_MODULE(_ext, m) {
             array: ``alpha * x + beta * y``
       )");
     
+    m.def("flash_attention", &tiny_llm_ext::flash_attention,
+          "q"_a, "k"_a, "v"_a, "mask"_a, "scale"_a, "num_kv_heads"_a, "num_heads"_a,
+          nb::kw_only(), "stream"_a = nb::none(),
+          R"(
+        Flash attention.
+
+        Args:
+            q (array): Query array of shape [N, L, E].
+            k (array): Key array of shape [N_KV, S, E].
+            v (array): Value array of shape [N_KV, S, E].
+            mask (array): Mask array of shape [N, L, S].
+            scale (float): Scaling factor applied to Q x K^T.
+            num_kv_heads (int): Number of key/value heads.
+            num_heads (int): Number of query heads.
+
+        Returns:
+            array: Output array of shape [N, L, E].
+      )");
+
     m.def("quantized_matmul", &tiny_llm_ext::quantized_matmul,
           "scales"_a, "biases"_a, "group_size"_a, "bits"_a, "a"_a, "b_quantized"_a, "transpose_b"_a,
           nb::kw_only(), "stream"_a = nb::none(),
