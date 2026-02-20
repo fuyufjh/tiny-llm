@@ -220,7 +220,7 @@ class Qwen2ModelWeek2:
         if args.tie_word_embeddings:
             self.lm_head = None
         else:
-            self.lm_head = mlx_model.lm_head
+            self.lm_head = QuantizedWeights.from_mlx_layer(mlx_model.lm_head)
 
     def __call__(
         self,

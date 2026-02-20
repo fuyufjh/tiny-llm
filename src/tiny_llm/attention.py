@@ -104,18 +104,20 @@ def scaled_dot_product_attention_grouped(
     key = key.reshape(*batch_dims, num_heads, 1, seq_length_kv, head_dim)
     value = value.reshape(*batch_dims, num_heads, 1, seq_length_kv, head_dim)
 
-    # Q @ K^T
-    scores = query @ mx.swapaxes(key, -1, -2)
+    # Q @ K^T — compute in float32 to avoid float16 overflow (QK dot products
+    # can exceed 65504 for large head_dim / large activations, e.g. Qwen2-7B)
+    orig_dtype = query.dtype
+    scores = query.astype(mx.float32) @ mx.swapaxes(key.astype(mx.float32), -1, -2)
     scores = scores * scale
     if isinstance(mask, mx.array):
         mask = mask.reshape(scores.shape)
-        scores = scores + mask
+        scores = scores + mask.astype(mx.float32)
     elif isinstance(mask, str) and mask == "causal":
-        mask = causal_mask(seq_length_q, seq_length_kv, query.dtype)
+        mask = causal_mask(seq_length_q, seq_length_kv, mx.float32)
         scores = scores + mask
 
     attention_weights = softmax(scores, axis=-1)
-    output = attention_weights @ value
+    output = (attention_weights @ value.astype(mx.float32)).astype(orig_dtype)
 
     # Reshape output back
     output = output.reshape(*batch_dims, num_query_heads, seq_length_q, head_dim)
