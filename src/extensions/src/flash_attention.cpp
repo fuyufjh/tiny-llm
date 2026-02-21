@@ -36,8 +36,11 @@ namespace tiny_llm_ext {
  */
 mx::array flash_attention(const mx::array &q, const mx::array &k, const mx::array &v, const mx::array &mask,
                           const float scale, const int num_kv_heads, const int num_heads, mx::StreamOrDevice s) {
-    if (q.dtype() != mx::float32 || k.dtype() != mx::float32 || v.dtype() != mx::float32 || mask.dtype() != mx::float32) {
-        throw std::runtime_error("flash_attention: all input arrays must be float32");
+    if (q.dtype() != mx::float16 || k.dtype() != mx::float16 || v.dtype() != mx::float16) {
+        throw std::runtime_error("flash_attention: q, k, v must be float16");
+    }
+    if (mask.dtype() != mx::float32) {
+        throw std::runtime_error("flash_attention: mask must be float32");
     }
     if (q.shape().size() != 3 || k.shape().size() != 3 || v.shape().size() != 3) {
         throw std::runtime_error("flash_attention: all input arrays must be 3D");
@@ -67,7 +70,7 @@ mx::array flash_attention(const mx::array &q, const mx::array &k, const mx::arra
         throw std::runtime_error("flash_attention: mask must be broadcastable to q, k, v");
     }
 
-    return mx::array(q.shape(), mx::float32,
+    return mx::array(q.shape(), mx::float16,
                      std::make_shared<FlashAttention>(to_stream(s), scale, num_kv_heads, num_heads), {q, k, v, mask});
 }
 
@@ -78,8 +81,8 @@ auto &q = inputs[0];
     auto &mask = inputs[3];
     auto &out = outputs[0];
 
-    if (out.dtype() != mx::float32) {
-        throw std::runtime_error("flash_attention: output dtype must be float32");
+    if (out.dtype() != mx::float16) {
+        throw std::runtime_error("flash_attention: output dtype must be float16");
     }
 
     out.set_data(mx::allocator::malloc(out.nbytes()));
@@ -102,14 +105,15 @@ auto &q = inputs[0];
     }
 
     // Launch the CPU kernel
-    encoder.dispatch([out_ptr = out.data<float>(), out_shape = out.shape(), q = mx::array::unsafe_weak_copy(q),
+    // q/k/v are float16; mask and internal computation stay float32
+    encoder.dispatch([out_ptr = out.data<mx::float16_t>(), out_shape = out.shape(), q = mx::array::unsafe_weak_copy(q),
                       k = mx::array::unsafe_weak_copy(k), v = mx::array::unsafe_weak_copy(v),
                       mask = mx::array::unsafe_weak_copy(mask), num_heads = num_heads_, num_kv_heads = num_kv_heads_,
                       scale = scale_]() {
-        const float* q_ptr    = q.data<float>();
-        const float* k_ptr    = k.data<float>();
-        const float* v_ptr    = v.data<float>();
-        const float* mask_ptr = mask.data<float>();
+        const mx::float16_t* q_ptr    = q.data<mx::float16_t>();
+        const mx::float16_t* k_ptr    = k.data<mx::float16_t>();
+        const mx::float16_t* v_ptr    = v.data<mx::float16_t>();
+        const float*         mask_ptr = mask.data<float>();
 
         const int N = q.shape()[0];
         const int L = q.shape()[1];
@@ -134,11 +138,11 @@ auto &q = inputs[0];
             // GQA: map query head n to its shared KV head
             int n_kv = (n / num_heads) * num_kv_heads + (n % num_heads) / G;
 
-            const float* Qn    = q_ptr    + n    * L * H;
-            const float* Kn_kv = k_ptr    + n_kv * S * H;
-            const float* Vn_kv = v_ptr    + n_kv * S * H;
-            const float* Mn    = mask_ptr + n    * L * S;
-            float*       On    = out_ptr  + n    * L * H;
+            const mx::float16_t* Qn    = q_ptr    + n    * L * H;
+            const mx::float16_t* Kn_kv = k_ptr    + n_kv * S * H;
+            const mx::float16_t* Vn_kv = v_ptr    + n_kv * S * H;
+            const float*         Mn    = mask_ptr + n    * L * S;
+            mx::float16_t*       On    = out_ptr  + n    * L * H;
 
             for (int i = 0; i < T_r; i++) {
                 const int qs = i * B_r;
@@ -155,13 +159,14 @@ auto &q = inputs[0];
                     const int bc = ke - ks;  // actual cols in this block
 
                     // S_buf[p][c] = scale * dot(Q[qs+p], K[ks+c]) + Mask[qs+p][ks+c]
+                    // Upcast float16 → float32 for dot product accumulation
                     for (int p = 0; p < br; p++) {
-                        const float* qrow = Qn + (qs + p) * H;
+                        const mx::float16_t* qrow = Qn + (qs + p) * H;
                         for (int c = 0; c < bc; c++) {
-                            const float* krow = Kn_kv + (ks + c) * H;
+                            const mx::float16_t* krow = Kn_kv + (ks + c) * H;
                             float dot = 0.0f;
                             for (int h = 0; h < H; h++) {
-                                dot += qrow[h] * krow[h];
+                                dot += static_cast<float>(qrow[h]) * static_cast<float>(krow[h]);
                             }
                             S_buf[p * B_c + c] = scale * dot + Mn[(qs + p) * S + (ks + c)];
                         }
@@ -190,23 +195,23 @@ auto &q = inputs[0];
                         l_buf[p] = alpha * l_buf[p] + rowsum;
                         m_buf[p] = m_new;
 
-                        // O[p] = alpha * O[p] + P̃[p] @ V_j
+                        // O[p] = alpha * O[p] + P̃[p] @ V_j  (upcast V from float16)
                         float* op = O_buf.data() + p * H;
                         for (int h = 0; h < H; h++) {
                             float pv = 0.0f;
                             for (int c = 0; c < bc; c++) {
-                                pv += P_buf[p * B_c + c] * Vn_kv[(ks + c) * H + h];
+                                pv += P_buf[p * B_c + c] * static_cast<float>(Vn_kv[(ks + c) * H + h]);
                             }
                             op[h] = alpha * op[h] + pv;
                         }
                     }
                 }
 
-                // Normalize by l and write to output HBM
+                // Normalize by l and write to output HBM, downcast float32 → float16
                 for (int p = 0; p < br; p++) {
                     const float inv_l = 1.0f / l_buf[p];
                     for (int h = 0; h < H; h++) {
-                        On[(qs + p) * H + h] = O_buf[p * H + h] * inv_l;
+                        On[(qs + p) * H + h] = mx::float16_t(O_buf[p * H + h] * inv_l);
                     }
                 }
             }
@@ -226,7 +231,7 @@ void FlashAttention::eval_gpu(const std::vector<mx::array> &inputs, std::vector<
 
     const int N  = q.shape()[0];
     const int L  = q.shape()[1];
-    const int E  = q.shape()[2];
+    const int H  = q.shape()[2];
     const int S  = k.shape()[1];
     const int Br = 32;
     const int Bc = 32;
@@ -235,7 +240,7 @@ void FlashAttention::eval_gpu(const std::vector<mx::array> &inputs, std::vector<
 
     auto &s      = stream();
     auto &d      = mx::metal::device(s.device);
-    auto  kernel = d.get_kernel("flash_attention_f32_e128", d.get_library("tiny_llm_ext"));
+    auto  kernel = d.get_kernel("flash_attention_f16_e128", d.get_library("tiny_llm_ext"));
     auto &enc    = d.get_command_encoder(s.index);
     enc.set_compute_pipeline_state(kernel);
 
@@ -254,7 +259,7 @@ void FlashAttention::eval_gpu(const std::vector<mx::array> &inputs, std::vector<
     enc.set_bytes(N,            7);
     enc.set_bytes(L,            8);
     enc.set_bytes(S,            9);
-    enc.set_bytes(E,           10);
+    enc.set_bytes(H,           10);
     enc.set_bytes(num_kv_heads_, 11);
     enc.set_bytes(num_heads_,    12);
     enc.set_bytes(scale_,        13);

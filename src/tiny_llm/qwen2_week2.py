@@ -72,9 +72,10 @@ class Qwen2MultiHeadAttention:
             scale = 1.0 / (self.head_dim ** 0.5)
 
             # Reshape: [batch, seq, heads, dim] → [batch*heads, seq, dim]
-            q_fa = q.transpose(0, 2, 1, 3).reshape(N, seq_length, self.head_dim).astype(mx.float32)
-            k_fa = k.transpose(0, 2, 1, 3).reshape(N_kv, S_total, self.head_dim).astype(mx.float32)
-            v_fa = v.transpose(0, 2, 1, 3).reshape(N_kv, S_total, self.head_dim).astype(mx.float32)
+            # q/k/v are already float16 from RoPE — no cast needed
+            q_fa = q.transpose(0, 2, 1, 3).reshape(N, seq_length, self.head_dim)
+            k_fa = k.transpose(0, 2, 1, 3).reshape(N_kv, S_total, self.head_dim)
+            v_fa = v.transpose(0, 2, 1, 3).reshape(N_kv, S_total, self.head_dim)
 
             # Build additive mask [1, seq_length, S_total]
             if isinstance(mask, str) and mask == "causal":
@@ -103,8 +104,9 @@ class Qwen2MultiHeadAttention:
                 scale, self.num_kv_heads, self.num_heads,
             )
             # x: [N, seq_length, head_dim] → [batch_size, seq_length, hidden_size]
+            # output is already float16 — no cast needed
             x = x.reshape(batch_size, self.num_heads, seq_length, self.head_dim)
-            x = x.transpose(0, 2, 1, 3).reshape(batch_size, seq_length, self.hidden_size).astype(mx.float16)
+            x = x.transpose(0, 2, 1, 3).reshape(batch_size, seq_length, self.hidden_size)
         else:
             q = q.transpose(0, 2, 1, 3) # batch_size x num_heads x seq_length x head_dim
             k = k.transpose(0, 2, 1, 3) # batch_size x num_kv_heads x seq_length x head_dim

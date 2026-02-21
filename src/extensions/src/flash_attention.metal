@@ -9,32 +9,32 @@ using namespace metal;
 // Threads: Br threads per threadgroup (one per query row in the block)
 //          mapped as: p = simd_gid * 32 + simd_lid
 //
-// Compile-time constants (kernel specialised for E ≤ 128, Bc ≤ 32):
-//   E_MAX = 128  (head dimension upper bound)
+// Compile-time constants (kernel specialised for H ≤ 128, Bc ≤ 32):
+//   H_MAX = 128  (head dimension upper bound)
 //   BC_MAX = 32  (KV block size upper bound)
 //
 // Threadgroup memory (16 KB, reused for K then V):
-//   kv_smem[BC_MAX * E_MAX]
+//   kv_smem[BC_MAX * H_MAX]
 //
 // Per-thread registers:
-//   q_reg[E_MAX]   — one Q row
-//   o_reg[E_MAX]   — output accumulator
+//   q_reg[H_MAX]   — one Q row
+//   o_reg[H_MAX]   — output accumulator
 //   s_row[BC_MAX]  — attention scores for one query row
 //   p_row[BC_MAX]  — softmax numerators
 //   l_i, m_i       — running sum and max
 
-[[kernel]] void flash_attention_f32_e128(
-    device const float* q [[buffer(0)]],
-    device const float* k [[buffer(1)]],
-    device const float* v [[buffer(2)]],
+[[kernel]] void flash_attention_f16_e128(
+    device const half* q [[buffer(0)]],
+    device const half* k [[buffer(1)]],
+    device const half* v [[buffer(2)]],
     device const float* mask [[buffer(3)]],
-    device float* out [[buffer(4)]],
-    constant const int* mask_shape [[buffer(5)]],
+    device half* out [[buffer(4)]],
+    [[maybe_unused]] constant const int* mask_shape [[buffer(5)]],
     constant const int64_t* mask_strides [[buffer(6)]],
-    device const int &N [[buffer(7)]],
+    [[maybe_unused]] device const int &N [[buffer(7)]],
     device const int &L [[buffer(8)]],
     device const int &S [[buffer(9)]],
-    device const int &E [[buffer(10)]],
+    device const int &H [[buffer(10)]],
     device const int &num_kv_heads [[buffer(11)]],
     device const int &num_heads [[buffer(12)]],
     device const float &scale [[buffer(13)]],
@@ -60,20 +60,22 @@ using namespace metal;
     const int q_row = qs + p;   // may exceed L for out-of-bounds threads
 
     // ── Threadgroup SRAM — reused for K then V ───────────────────────────────
-    threadgroup float kv_smem[32 * 128];  // BC_MAX * E_MAX
+    // Stored as half (same precision as device memory) — saves 8 KB vs float.
+    // Dot products still accumulate in float32 registers (upcast on read).
+    threadgroup half kv_smem[32 * 128];  // BC_MAX * H_MAX
 
     // ── Per-thread registers ─────────────────────────────────────────────────
-    float q_reg[128];   // Q[n][q_row][:]
-    float o_reg[128];   // output accumulator
+    half  q_reg[128];   // Q[n][q_row][:] — half OK: read-only, no accumulation
+    float o_reg[128];   // output accumulator — must stay float32: accumulates over T_c iters
     float l_i = 0.0f;
     float m_i = -INFINITY;
 
-    for (int h = 0; h < E; h++) o_reg[h] = 0.0f;
+    for (int h = 0; h < H; h++) o_reg[h] = 0.0f;
 
-    // Load Q row into registers (skip for out-of-bounds threads)
+    // Load Q row into registers (half → half, no cast needed)
     if (q_row < L) {
-        const int base = (n * L + q_row) * E;
-        for (int h = 0; h < E; h++) q_reg[h] = q[base + h];
+        const int base = (n * L + q_row) * H;
+        for (int h = 0; h < H; h++) q_reg[h] = q[base + h];
     }
 
     // ── Main loop over KV blocks ─────────────────────────────────────────────
@@ -82,11 +84,11 @@ using namespace metal;
         const int ke = min(ks + Bc, S);
         const int bc = ke - ks;  // actual KV columns in this block
 
-        // ── Phase 1: load K_j into threadgroup memory ────────────────────────
+        // ── Phase 1: load K_j into threadgroup memory (half → half, no cast) ─
         // Thread p loads row p of K_j  (safe even when q_row >= L)
         if (p < bc) {
-            const int base = (n_kv * S + ks + p) * E;
-            for (int h = 0; h < E; h++) kv_smem[p * E + h] = k[base + h];
+            const int base = (n_kv * S + ks + p) * H;
+            for (int h = 0; h < H; h++) kv_smem[p * H + h] = k[base + h];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);  // K ready
 
@@ -95,7 +97,7 @@ using namespace metal;
         if (q_row < L) {
             for (int c = 0; c < bc; c++) {
                 float dot = 0.0f;
-                for (int h = 0; h < E; h++) dot += q_reg[h] * kv_smem[c * E + h];
+                for (int h = 0; h < H; h++) dot += q_reg[h] * float(kv_smem[c * H + h]);
                 int64_t mask_off = (int64_t)n * mask_strides[0]
                                  + (int64_t)q_row * mask_strides[1]
                                  + (int64_t)(ks + c) * mask_strides[2];
@@ -123,13 +125,13 @@ using namespace metal;
             m_i = m_new;
 
             // Rescale existing O accumulator
-            for (int h = 0; h < E; h++) o_reg[h] *= alpha;
+            for (int h = 0; h < H; h++) o_reg[h] *= alpha;
         }
 
-        // ── Phase 3: load V_j into threadgroup memory (overwrite K slot) ─────
+        // ── Phase 3: load V_j into threadgroup memory (half → half, no cast) ─
         if (p < bc) {
-            const int base = (n_kv * S + ks + p) * E;
-            for (int h = 0; h < E; h++) kv_smem[p * E + h] = v[base + h];
+            const int base = (n_kv * S + ks + p) * H;
+            for (int h = 0; h < H; h++) kv_smem[p * H + h] = v[base + h];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);  // V ready
 
@@ -137,16 +139,16 @@ using namespace metal;
         if (q_row < L) {
             for (int c = 0; c < bc; c++) {
                 const float pv = p_row[c];
-                for (int h = 0; h < E; h++) o_reg[h] += pv * kv_smem[c * E + h];
+                for (int h = 0; h < H; h++) o_reg[h] += pv * float(kv_smem[c * H + h]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);  // V reads done → safe to overwrite with K next iter
     }
 
-    // ── Normalize and write output ───────────────────────────────────────────
+    // ── Normalize and write output, downcast float → half ───────────────────
     if (q_row < L) {
         const float inv_l = 1.0f / l_i;
-        const int   base  = (n * L + q_row) * E;
-        for (int h = 0; h < E; h++) out[base + h] = o_reg[h] * inv_l;
+        const int   base  = (n * L + q_row) * H;
+        for (int h = 0; h < H; h++) out[base + h] = half(o_reg[h] * inv_l);
     }
 }
