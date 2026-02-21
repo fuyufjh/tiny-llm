@@ -9,6 +9,7 @@ from typing import Any
 from .embedding import Embedding
 from .quantize import dequantize_linear, QuantizedWeights
 from .kv_cache import TinyKvCache
+from extensions import tiny_llm_ext
 
 
 class Qwen2MultiHeadAttention:
@@ -64,13 +65,54 @@ class Qwen2MultiHeadAttention:
         # Update the cache and fetch the updated full key and value
         k, v, _, mask = cache.update_and_fetch(k, v, mask_length=seq_length, mask=mask)
 
-        q = q.transpose(0, 2, 1, 3) # batch_size x num_heads x seq_length x head_dim
-        k = k.transpose(0, 2, 1, 3) # batch_size x num_kv_heads x seq_length x head_dim
-        v = v.transpose(0, 2, 1, 3) # batch_size x num_kv_heads x seq_length x head_dim
+        if self.use_flash_attention:
+            S_total = k.shape[1]
+            N    = batch_size * self.num_heads
+            N_kv = batch_size * self.num_kv_heads
+            scale = 1.0 / (self.head_dim ** 0.5)
 
-        x = scaled_dot_product_attention_grouped(q, k, v, mask=mask) # batch_size x num_heads x seq_length x head_dim
+            # Reshape: [batch, seq, heads, dim] → [batch*heads, seq, dim]
+            q_fa = q.transpose(0, 2, 1, 3).reshape(N, seq_length, self.head_dim).astype(mx.float32)
+            k_fa = k.transpose(0, 2, 1, 3).reshape(N_kv, S_total, self.head_dim).astype(mx.float32)
+            v_fa = v.transpose(0, 2, 1, 3).reshape(N_kv, S_total, self.head_dim).astype(mx.float32)
 
-        x = x.transpose(0, 2, 1, 3).reshape(batch_size, seq_length, self.hidden_size)
+            # Build additive mask [1, seq_length, S_total]
+            if isinstance(mask, str) and mask == "causal":
+                # q absolute positions: [S_total - seq_length, S_total)
+                q_idx = mx.arange(S_total - seq_length, S_total)  # [L]
+                k_idx = mx.arange(S_total)                         # [S_total]
+                # causal: key must not be in the future relative to the query
+                mask_fa = mx.where(
+                    k_idx[None, :] <= q_idx[:, None],
+                    mx.zeros((seq_length, S_total), dtype=mx.float32),
+                    mx.full((seq_length, S_total), float("-inf"), dtype=mx.float32),
+                )[None]  # [1, seq_length, S_total]
+            elif mask is None:
+                mask_fa = mx.zeros((1, seq_length, S_total), dtype=mx.float32)
+            else:
+                mask_fa = mask
+                if mask_fa.ndim == 4:
+                    mask_fa = mask_fa.squeeze(1)  # [B, 1, L, S] → [B, L, S]
+                mask_fa = mask_fa.astype(mx.float32)
+
+            # Broadcast mask to [N, seq_length, S_total] (zero-copy via strides)
+            mask_fa = mx.broadcast_to(mask_fa, (N, seq_length, S_total))
+
+            x = tiny_llm_ext.flash_attention(
+                q_fa, k_fa, v_fa, mask_fa,
+                scale, self.num_kv_heads, self.num_heads,
+            )
+            # x: [N, seq_length, head_dim] → [batch_size, seq_length, hidden_size]
+            x = x.reshape(batch_size, self.num_heads, seq_length, self.head_dim)
+            x = x.transpose(0, 2, 1, 3).reshape(batch_size, seq_length, self.hidden_size).astype(mx.float16)
+        else:
+            q = q.transpose(0, 2, 1, 3) # batch_size x num_heads x seq_length x head_dim
+            k = k.transpose(0, 2, 1, 3) # batch_size x num_kv_heads x seq_length x head_dim
+            v = v.transpose(0, 2, 1, 3) # batch_size x num_kv_heads x seq_length x head_dim
+
+            x = scaled_dot_product_attention_grouped(q, k, v, mask=mask) # batch_size x num_heads x seq_length x head_dim
+
+            x = x.transpose(0, 2, 1, 3).reshape(batch_size, seq_length, self.hidden_size)
         x = quantized_linear(x, self.wo)
         return x
 
@@ -133,6 +175,7 @@ class Qwen2TransformerBlock:
             bv=bv,
             max_seq_len=max_seq_len,
             theta=theta,
+            use_flash_attention=use_flash_attention,
         )
         self.mlp = Qwen2MLP(
             dim=hidden_size,
@@ -212,6 +255,7 @@ class Qwen2ModelWeek2:
                 w_post_attention_layernorm=model.layers[i].post_attention_layernorm.weight,
                 max_seq_len=args.max_position_embeddings,
                 theta=int(args.rope_theta),
+                use_flash_attention=enable_flash_attn,
             )
             self.blocks.append(block)
         

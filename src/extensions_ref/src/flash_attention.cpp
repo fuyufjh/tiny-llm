@@ -232,6 +232,39 @@ void FlashAttention::eval_cpu(const std::vector<mx::array> &inputs, std::vector<
     });
 }
 
+/**
+ * Flash Attention 2
+ * 
+Require: Q[N,L,H], K[N_KV,S,H], V[N_KV,S,H], M[N,L,S] (additive, -inf for masked)
+         G = num_heads / num_kv_heads
+         B_r, B_c: block sizes
+
+for n = 0 to N-1 do
+  n_kv = (n / num_heads) * num_kv_heads + (n % num_heads) / G
+
+  for i = 0 to T_r-1 do                   // ── GPU: parallel over (n, i)
+    qs = i*B_r,  qe = min(qs+B_r, L)
+    Load Q_i[0:br, H] to SRAM
+    O_i = 0,  l_i = 0,  m_i = -∞
+
+    for j = 0 to T_c-1 do                 // ── GPU: sequential within threadgroup
+      ks = j*B_c,  ke = min(ks+B_c, S)
+      if ks >= qe then break               // causal skip: all future blocks also masked
+
+      Load K_j, V_j to SRAM
+      S_ij = scale * Q_i @ K_j^T          // [br, bc]
+      S_ij += M[n, qs:qe, ks:ke]          // apply additive mask
+
+      m_new    = max(m_i, rowmax(S_ij))
+      α        = exp(m_i − m_new)          // ∈ [0,1]
+      P̃_ij    = exp(S_ij − m_new)         // [br, bc]
+      l_i      = α ⊙ l_i + rowsum(P̃_ij)
+      O_i      = α * O_i + P̃_ij @ V_j
+      m_i      = m_new
+
+    O_i = O_i / l_i                        // normalize
+    Write O_i to O[n, qs:qe, :]
+ */
 void FlashAttention::eval_gpu(const std::vector<mx::array> &inputs, std::vector<mx::array> &outputs) {
     const auto &q = inputs[0];
     const auto &k = inputs[1];
